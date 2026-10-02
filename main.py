@@ -1,16 +1,19 @@
 import datetime as dt
 import hashlib
+import ipaddress
 import json
 import os
+import socket
 import ssl
 import time
 import uuid
+from urllib.parse import urlsplit
 
 import httpx
 import psycopg2
 import psycopg2.extras
 import redis
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -20,6 +23,29 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 VALKEY_URL = os.environ.get("VALKEY_URL", "")
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "60"))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "15"))
+
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT", "20"))
+RATE_WINDOW = float(os.environ.get("RATE_WINDOW", "60"))
+CHECK_TOKEN = os.environ.get("CHECK_TOKEN", "")
+
+_rate_hits = {}
+_rate_lock = __import__("threading").Lock()
+
+PRIVATE_NETS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::/128"),
+]
 
 _redis_client = None
 
@@ -63,6 +89,55 @@ def init_db():
         conn.close()
 
 
+def is_private_host(host: str) -> bool:
+    """Resolve host and return True if any resolved IP is private/reserved."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    seen = set()
+    for info in infos:
+        addr = info[4][0]
+        if addr in seen:
+            continue
+        seen.add(addr)
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        for net in PRIVATE_NETS:
+            if ip in net:
+                return True
+    return False
+
+
+def validate_url(value: str) -> str:
+    """Validate and normalize a URL; raise ValueError if disallowed."""
+    value = value.strip()
+    if not value:
+        raise ValueError("empty URL")
+    if not value.lower().startswith(("http://", "https://")):
+        value = "https://" + value
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("only http/https allowed")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("invalid host")
+    try:
+        ip = ipaddress.ip_address(host)
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+    if is_ip_literal:
+        for net in PRIVATE_NETS:
+            if ip in net:
+                raise ValueError("private/reserved host not allowed")
+    elif is_private_host(host):
+        raise ValueError("private/reserved host not allowed")
+    return value
+
+
 def normalize_url(value: str) -> str:
     value = value.strip()
     if not value.startswith("http://") and not value.startswith("https://"):
@@ -71,7 +146,7 @@ def normalize_url(value: str) -> str:
 
 
 def perform_check(raw_url: str):
-    url = normalize_url(raw_url)
+    url = validate_url(raw_url)
     result = {
         "url": url,
         "http_status": None,
@@ -82,8 +157,6 @@ def perform_check(raw_url: str):
     }
     start = time.time()
     try:
-        import socket
-
         host = url.split("://", 1)[1].split("/", 1)[0].split(":")[0]
         try:
             socket.getaddrinfo(host, None)
@@ -194,9 +267,35 @@ class CheckRequest(BaseModel):
     url: str
 
 
+def rate_limited(key: str) -> bool:
+    now = time.time()
+    with _rate_lock:
+        hits = [t for t in _rate_hits.get(key, []) if now - t < RATE_WINDOW]
+        if len(hits) >= RATE_LIMIT:
+            _rate_hits[key] = hits
+            return True
+        hits.append(now)
+        _rate_hits[key] = hits
+        return False
+
+
+def client_key(req: Request) -> str:
+    return req.client.host if (req.client and req.client.host) else "unknown"
+
+
 @app.post("/api/check")
-def check_url(req: CheckRequest):
-    result = perform_check(req.url)
+def check_url(req: CheckRequest, request: Request):
+    if CHECK_TOKEN:
+        auth = request.headers.get("x-check-token", "")
+        if auth != CHECK_TOKEN:
+            raise HTTPException(status_code=401, detail="unauthorized")
+    key = client_key(request)
+    if rate_limited(key):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+    try:
+        result = perform_check(req.url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     result["id"] = persist_result(result)
     result["cache_key"] = cache_result(result)
     return result
