@@ -280,6 +280,10 @@ def rate_limited(key: str) -> bool:
 
 
 def client_key(req: Request) -> str:
+    forwarded = req.headers.get("x-forwarded-for", "")
+    if forwarded:
+        # X-Forwarded-For is "client, proxy1, proxy2, ..."; take the first (original) client.
+        return forwarded.split(",")[0].strip()
     return req.client.host if (req.client and req.client.host) else "unknown"
 
 
