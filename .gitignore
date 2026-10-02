@@ -2,3 +2,4 @@
 .env*
 .do/spec.json
 .do/app_db_uri.txt
+__pycache__/
