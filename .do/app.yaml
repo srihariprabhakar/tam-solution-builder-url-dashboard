@@ -1,0 +1,24 @@
+name: tam-solution-builder-dashboard
+region: nyc
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    source_dir: /
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    envs:
+      - key: DATABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: PGPLACEHOLDER
+      - key: VALKEY_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: VALKEYPLACEHOLDER
+      - key: CACHE_TTL
+        scope: RUN_TIME
+        value: "60"
+      - key: CHECK_TIMEOUT
+        scope: RUN_TIME
+        value: "15"
